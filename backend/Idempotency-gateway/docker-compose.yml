@@ -1,0 +1,48 @@
+version: '3.8'
+
+services:
+  postgres-idempotency:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: postgres
+      POSTGRES_DB: idempotency_db
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_idempotency_data:/var/lib/postgresql/data
+    networks:
+      - idempotency-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  idempotency-gateway:
+    build: .
+    ports:
+      - "8001:8001"
+    environment:
+      SPRING_DATASOURCE_URL: jdbc:postgresql://postgres-idempotency:5432/idempotency_db
+      SPRING_DATASOURCE_USERNAME: postgres
+      SPRING_DATASOURCE_PASSWORD: postgres
+      SPRING_JPA_HIBERNATE_DDL_AUTO: update
+    depends_on:
+      postgres-idempotency:
+        condition: service_healthy
+    networks:
+      - idempotency-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8001/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s
+
+volumes:
+  postgres_idempotency_data:
+
+networks:
+  idempotency-network:
+    driver: bridge
