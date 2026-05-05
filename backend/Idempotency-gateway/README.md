@@ -1,155 +1,356 @@
-# Idempotency-Gateway (The "Pay-Once" Protocol)
+# Idempotency Gateway
 
-This challenge is designed to test your ability to bridge Computer Science fundamentals with Modern Backend Engineering.
+A Spring Boot REST API that implements an idempotency layer for exactly-once payment processing. Retrying a failed or timed-out request always returns the original response without re-charging the customer.
 
-## 1. Business Context
+---
 
-> **Client:** _FinSafe Transactions Ltd._ (A fast-growing Payment Processor).
+## Architecture Diagram
+
+The sequence diagram below covers five flows: new payment, idempotency replay, payload conflict, multi-node race condition, and TTL cleanup.
+
+![Idempotency Gateway Sequence Diagram](docs/sequence-diagram.png)
+
+
+---
+
+## Setup Instructions
+
+### Prerequisites
+
+| Tool | Version |
+|------|---------|
+| Java | 17+ |
+| Maven | 3.8+ |
+| Docker & Docker Compose | 20+ |
+| PostgreSQL (local) | 15+ (or use Docker) |
+
+---
+
+### Option A — Docker Compose (recommended)
+
+Starts both PostgreSQL and the application in one command.
+
+```bash
+# 1. Build the JAR
+mvn clean package -DskipTests
+
+# 2. Start everything
+docker-compose up --build
+```
+
+The API is available at `http://localhost:8001`.
+
+To stop:
+
+```bash
+docker-compose down
+```
+
+To stop and wipe the database volume:
+
+```bash
+docker-compose down -v
+```
+
+---
+
+### Option B — Local (Maven + existing PostgreSQL)
+
+```bash
+# 1. Create the database
+psql -U postgres -c "CREATE DATABASE idempotency_db;"
+
+# 2. Run the application
+mvn spring-boot:run
+```
+
+Default database credentials are `postgres / postgres` on `localhost:5432`. Override them via environment variables:
+
+```bash
+export SPRING_DATASOURCE_URL=jdbc:postgresql://localhost:5432/idempotency_db
+export SPRING_DATASOURCE_USERNAME=your_user
+export SPRING_DATASOURCE_PASSWORD=your_password
+mvn spring-boot:run
+```
+
+---
+
+### Run Tests
+
+Tests use an H2 in-memory database and require no external services.
+
+```bash
+mvn test
+```
+
+---
+
+## API Documentation
+
+### Base URL
+
+```
+http://localhost:8001
+```
+
+---
+
+### POST `/process-payment`
+
+Process a payment. Returns a cached response on replay.
+
+**Headers**
+
+| Header | Required | Description |
+|--------|----------|-------------|
+| `Idempotency-Key` | Yes | Unique string (1–255 chars) identifying this request |
+| `Content-Type` | Yes | `application/json` |
+
+**Request Body**
+
+```json
+{
+  "amount": 150.00,
+  "currency": "GHS"
+}
+```
+
+| Field | Type | Constraints |
+|-------|------|-------------|
+| `amount` | `number` | Required, must be positive |
+| `currency` | `string` | Required, exactly 3 uppercase letters (ISO 4217) |
+
+---
+
+**Responses**
+
+#### 201 Created — new payment processed
+
+```json
+{
+  "message": "Charged 150.00 GHS",
+  "transactionId": "b3d2e1f4-...",
+  "timestamp": 1748123456789
+}
+```
+
+Response header: `X-Cache-Hit: false`
+
+---
+
+#### 200 OK — duplicate key, same payload (idempotency replay)
+
+Returns the exact same body as the original `201` response.
+
+Response header: `X-Cache-Hit: true`
+
+---
+
+#### 422 Unprocessable Entity — same key, different payload
+
+```json
+{
+  "error": "Idempotency key already used for a different request body.",
+  "status": 422,
+  "timestamp": "2025-05-05T10:30:00"
+}
+```
+
+---
+
+#### 400 Bad Request — validation failure
+
+Missing or blank `Idempotency-Key`:
+```json
+{
+  "error": "Missing or invalid Idempotency-Key header",
+  "status": 400
+}
+```
+
+Key exceeds 255 characters:
+```json
+{
+  "error": "Idempotency-Key must not exceed 255 characters",
+  "status": 400
+}
+```
+
+Invalid body fields:
+```json
+{
+  "errors": {
+    "currency": "Currency must be a valid 3-letter ISO 4217 code (e.g. USD, GHS, EUR)",
+    "amount": "Amount must be positive"
+  },
+  "status": 400
+}
+```
+
+---
+
+### GET `/process-payment`
+
+Returns all stored transactions.
+
+**Response — 200 OK**
+
+```json
+[
+  {
+    "idempotencyKey": "pay-001",
+    "transactionId": "b3d2e1f4-...",
+    "message": "Charged 150.00 GHS",
+    "statusCode": 201,
+    "createdAt": "2025-05-05T10:00:00",
+    "updatedAt": "2025-05-05T10:00:00"
+  }
+]
+```
+
+---
+
+### GET `/process-payment/{idempotencyKey}`
+
+Returns a single transaction by its idempotency key.
+
+**Response — 200 OK**
+
+```json
+{
+  "idempotencyKey": "pay-001",
+  "transactionId": "b3d2e1f4-...",
+  "message": "Charged 150.00 GHS",
+  "statusCode": 201,
+  "createdAt": "2025-05-05T10:00:00",
+  "updatedAt": "2025-05-05T10:00:00"
+}
+```
+
+**Response — 400 Bad Request** (key not found)
+
+```json
+{
+  "error": "No transaction found for key: pay-999"
+}
+```
+
+---
+
+## Design Decisions
+
+### 1. UUID Primary Key
+
+UUIDs are generated at the application layer, not the database. This removes a round-trip to the DB for ID allocation and works correctly across horizontally scaled nodes without coordination.
+
+### 2. Store Request and Response as JSON Strings
+
+Both the original request body and the processed response are persisted as plain JSON text. This provides a full audit trail, allows the exact original response to be replayed byte-for-byte, and avoids schema migrations when the payment model evolves.
+
+### 3. Database UNIQUE Constraint as the Safety Net
+
+`idempotency_key` carries a `UNIQUE` constraint at the database level. This is the last line of defence for multi-node deployments where two instances could both pass the in-memory check simultaneously. The service catches `DataIntegrityViolationException` from the constraint violation, fetches the winning node's already-stored response, and returns it as a cache hit — no 500 error, no lost response.
+
+### 4. `saveAndFlush` Instead of `save`
+
+Spring Data JPA defers the SQL `INSERT` until the end of the transaction by default (`save` only adds to the persistence context). Using `saveAndFlush` forces the write immediately so a `DataIntegrityViolationException` surfaces inside the method boundary where it can be caught and handled gracefully, rather than at commit time where it would escape unhandled.
+
+### 5. Per-Key `ReentrantLock` for Same-Node Concurrency
+
+A `ConcurrentHashMap<String, ReentrantLock>` ensures that concurrent requests carrying the same idempotency key on the same JVM are serialised. The second request waits until the first request's transaction has fully committed before checking the database, guaranteeing it will find the cached record. Multi-node concurrency is handled at the database layer (see decision 3).
+
+### 6. Self-Injection via `@Lazy` for `@Transactional`
+
+Spring's `@Transactional` works through AOP proxies. Calling `this.doProcessPayment()` from within the same bean bypasses the proxy and the transaction is silently ignored. The service injects itself via `@Lazy @Autowired` so `doProcessPayment` is called through the proxy, ensuring the transaction commits before the lock is released.
+
+### 7. Structural JSON Comparison with `JsonNode`
+
+Payload matching uses `JsonNode.equals()` (Jackson) instead of raw string equality. String comparison is fragile because field serialisation order is not guaranteed across Jackson versions or different serialisation contexts. Structural comparison treats `{"amount":100,"currency":"GHS"}` and `{"currency":"GHS","amount":100}` as identical — which they are — preventing false 422 conflicts.
+
+### 8. Idempotency Key Length Validation
+
+The database column is `VARCHAR(255)`. A key longer than 255 characters would fail with an opaque database error. An explicit check in the controller rejects oversized keys with a clean `400 Bad Request` before the request reaches the database.
+
+### 9. Currency Format Validation
+
+The `currency` field is validated against the pattern `[A-Z]{3}`, enforcing ISO 4217 format at the API boundary. Lowercase codes (`usd`), empty strings, and arbitrary values are rejected with a descriptive field error instead of being stored and silently ignored.
+
+---
+
+## Developer's Choice: Idempotency Key TTL (Time-To-Live)
 
 ### The Problem
 
-FinSafe's clients (e-commerce shops) occasionally experience network timeouts. When this happens, their servers automatically retry sending payment requests. Recently, this has led to a critical issue: **Double Charging**.
+Without expiry, idempotency keys are stored forever. A key created today could still block a legitimate future payment with the same identifier months later. Storage also grows unboundedly, which becomes a cost and performance concern for high-volume payment processors.
 
-If a customer clicks "Pay," the request is sent, but the network lags. The client retries the request. FinSafe processes _both_ requests, charging the customer twice. This is causing customer churn and regulatory headaches.
+### The Implementation
 
-### The Solution
+A scheduled background job runs every hour and deletes any `payment_requests` records whose `created_at` timestamp is older than **24 hours**.
 
-FinSafe needs you to build an **Idempotency Layer**. This is a middleware service (or API) that ensures no matter how many times a client sends the same request, the payment is processed **exactly once**.
+```java
+@Scheduled(fixedRateString = "${idempotency.ttl.cleanup-interval-ms:3600000}")
+@Transactional
+public void cleanupExpiredKeys() {
+    LocalDateTime cutoff = LocalDateTime.now().minusHours(24);
+    int deleted = paymentRequestRepository.deleteExpiredKeys(cutoff);
+    if (deleted > 0) {
+        log.info("TTL cleanup: removed {} expired idempotency keys", deleted);
+    }
+}
+```
 
----
+The cleanup interval is configurable via `idempotency.ttl.cleanup-interval-ms` in `application.properties`.
 
-## 2. Technical Objective
+### Why 24 Hours
 
-Build a RESTful API that mimics a payment processing backend. It must check for a unique `Idempotency-Key` in the HTTP headers.
+- **Retry window:** Most payment clients implement retry logic with exponential back-off. A 24-hour window far exceeds any realistic retry window while keeping the table lean.
+- **Regulatory alignment:** Financial transaction systems typically require retaining transaction records for at least 24 hours for dispute resolution and audit purposes. Deleting after 24 hours complies with this minimum without over-retaining data.
+- **Configurable per environment:** Production may require a longer window (e.g., 72 hours); a test or staging environment can use a shorter window (e.g., 1 hour) to keep the database clean.
 
-- **First Request:** Process the payment and save the response.
-- **Duplicate Request:** Detect the existing key and return the _saved_ response immediately, without processing the payment again.
+### Why This Matters in Fintech
 
----
+Unbounded key storage is a known operational hazard in payment systems. Without TTL:
+- Storage costs grow linearly with transaction volume.
+- Key lookup queries degrade as the table grows.
+- Old keys can produce surprising conflicts for clients who reuse key formats (e.g., `order-{id}`) across billing cycles.
 
-## 3. Getting Started
-
-1.  **Fork this Repository:** Do not clone it directly. Create a fork to your own GitHub account.
-2.  **Environment:** You may use **Node.js, Python, Java or Go, etc.**. You may use any database or in-memory store (Redis, SQLite, or a simple native Map/Dictionary variable).
-3.  **Submission:** Your final submission will be a link to your forked repository containing the source code and documentation.
-
----
-
-## 4. The Architecture Diagram
-
-**Task:** Before you write any code, you must design the logic flow.
-**Deliverable:** A **Sequence Diagram** or **Flowchart** included in your README.
-
----
-
-## 5. User Stories & Acceptance Criteria
-
-### User Story 1: The First Transaction (Happy Path)
-
-**As a** client system (e.g., an online store),
-**I want to** send a payment request with a unique ID,
-**So that** my transaction is processed successfully.
-
-**Acceptance Criteria:**
-
-- [ ] The API accepts a `POST` request to endpoint `/process-payment`.
-- [ ] The request header must contain `Idempotency-Key: <some-unique-string>`.
-- [ ] The request body accepts a JSON object (e.g., `{"amount": 100, "currency": "GHS"}`).
-- [ ] The server simulates processing (e.g., a 2-second delay) and returns a `200 OK` or `201 Created` response.
-- [ ] The response body should include a status message: `"Charged 100 GHS"`.
-
-### User Story 2: The Duplicate Attempt (Idempotency Logic)
-
-**As a** client system,
-**I want to** safely retry a request if I don't hear back,
-**So that** I don't accidentally double-charge the user.
-
-**Acceptance Criteria:**
-
-- [ ] If the client sends a second `POST` request with the **same** `Idempotency-Key` and payload:
-  - [ ] The server must **NOT** run the processing logic again (no 2-second delay).
-  - [ ] The server must return the **exact same** response body and status code as the first successful request.
-  - [ ] The server returns a header `X-Cache-Hit: true` to indicate this was a replayed response.
-
-### User Story 3: Different Request, Same Key (Fraud/Error Check)
-
-**As a** security officer,
-**I want to** reject requests that reuse keys for different payments,
-**So that** we maintain data integrity.
-
-**Acceptance Criteria:**
-
-- [ ] If a request arrives with an existing `Idempotency-Key` but a **different** request body (e.g., changing amount from 100 to 500):
-  - [ ] The server must return a `422 Unprocessable Entity` or `409 Conflict` error.
-  - [ ] The error message should state: `"Idempotency key already used for a different request body."`
+The TTL feature turns the idempotency store from an ever-growing ledger into a bounded, self-maintaining cache.
 
 ---
 
-## 6. Bonus User Story (The "In-Flight" Check)
+## Project Structure
 
-**As a** system architect,
-**I want to** handle cases where two identical requests arrive at the exact same time,
-**So that** we don't succumb to race conditions.
-
-**Scenario:** Request A arrives. While Request A is still "processing" (during the 2-second delay), Request B (same key) arrives.
-
-**Acceptance Criteria:**
-
-- [ ] Request B should not start a new process.
-- [ ] Request B should not return `409 Conflict`.
-- [ ] Request B should wait (block) until Request A finishes, and then return the result of Request A.
-
----
-
-## 7. The "Developer's Choice" Challenge
-
-We believe great engineers are also product thinkers.
-
-**Task:** Identify **one** additional feature or safety mechanism that would make this system better for a real-world Fintech company.
-
-1.  **Implement it.**
-2.  **Document it:** Explain _why_ you added it in your README.
-
----
-
-## 8. Documentation Requirements
-
-Your final `README.md` must replace these instructions. It must cover:
-
-1.  **Architecture Diagram**
-2.  **Setup Instructions**
-3.  **API Documentation**
-4.  **Design Decisions**
-5.  **The Developer's Choice:** Description of the extra feature you added.
+```
+src/
+├── main/java/com/idempotency/
+│   ├── controller/
+│   │   └── PaymentController.java       # REST endpoints, header & key validation
+│   ├── service/
+│   │   └── PaymentService.java          # Business logic, locking, TTL cleanup
+│   ├── repository/
+│   │   └── PaymentRequestRepository.java
+│   ├── entity/
+│   │   └── PaymentRequest.java          # JPA entity mapped to payment_requests
+│   ├── dto/
+│   │   ├── PaymentRequestDto.java       # Validated request model
+│   │   └── PaymentResponseDto.java      # Response model
+│   ├── exception/
+│   │   ├── GlobalExceptionHandler.java
+│   │   ├── IdempotencyConflictException.java
+│   │   └── BadRequestException.java
+│   └── IdempotencyGatewayApplication.java
+└── test/java/com/idempotency/
+    └── controller/
+        └── PaymentControllerTest.java   # Integration tests (H2 in-memory)
+```
 
 ---
 
-Submit your repo link via the [online](https://forms.cloud.microsoft/e/bLyGT3byxx) form.
+## Environment Variables
 
----
-
-## 🛑 Pre-Submission Checklist
-
-**WARNING:** Before you submit your solution, you **MUST** pass every item on this list.
-If you miss any of these critical steps, your submission will be **automatically rejected** and you will **NOT** be invited to an interview.
-
-### 1. 📂 Repository & Code
-
-- [ ] **Public Access:** Is your GitHub repository set to **Public**? (We cannot review private repos).
-- [ ] **Clean Code:** Did you remove unnecessary files (like `node_modules`, `.env` with real keys, or `.DS_Store`)?
-- [ ] **Run Check:** if we clone your repo and run `npm start` (or equivalent), does the server start immediately without crashing?
-
-### 2. 📄 Documentation (Crucial)
-
-- [ ] **Architecture Diagram:** Did you include a visual Diagram (Flowchart or Sequence Diagram) in the README?
-- [ ] **README Swap:** Did you **DELETE** the original instructions (the problem brief) from this file and replace it with your own documentation?
-- [ ] **API Docs:** Is there a clear list of Endpoints and Example Requests in the README?
-
-### 3. 🧹 Git Hygiene
-
-- [ ] **Commit History:** Does your repo have multiple commits with meaningful messages? (A single "Initial Commit" is a red flag).
-
----
-
-**Ready?**
-If you checked all the boxes above, submit your repository link in the application form. Good luck! 🚀
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `SPRING_DATASOURCE_URL` | `jdbc:postgresql://localhost:5432/idempotency_db` | Database URL |
+| `SPRING_DATASOURCE_USERNAME` | `postgres` | Database username |
+| `SPRING_DATASOURCE_PASSWORD` | `postgres` | Database password |
+| `IDEMPOTENCY_TTL_CLEANUP_INTERVAL_MS` | `3600000` (1 hour) | TTL cleanup interval in milliseconds |
